@@ -278,6 +278,13 @@ nav button.hide{display:none}
             <div class="t" id="stampT"></div><div class="d" id="stampD"></div><div class="r" id="stampR"></div>
           </div>
           <button class="btn" id="btnSend" style="width:100%;margin-top:11px;display:none">Envoyer la demande</button>
+
+          <div id="deroBox" style="display:none;margin-top:13px;padding:14px;border:1px dashed var(--red);border-radius:var(--r);background:#FDF9F9">
+            <label for="cJust" style="color:var(--red)">Motif de la dérogation</label>
+            <input type="text" id="cJust" placeholder="Ex : chaussures percées, usure anormale…" maxlength="120">
+            <div class="hint">Sera transmis au magasin, au HSE et aux RH pour validation.</div>
+            <button class="btn" id="btnDero" style="width:100%;margin-top:11px;background:var(--red)">Demander une dérogation</button>
+          </div>
         </div>
       </div>
       <div class="card">
@@ -370,7 +377,12 @@ const CONFIG = {
   // règle de répartition quand un mouvement porte 2 matricules ("823/819")
   SPLIT_MULTI: true   // true = qté et montant divisés à parts égales entre les matricules
 };
-const STATUTS_COMPTES = ["Demande reçue","Validée","Livrée"];
+const STATUTS_COMPTES = ["Demande reçue","Validée","Livrée","Dérogation validée"];
+// "Dérogation demandée" n'est PAS comptée tant qu'elle n'est pas validée par les 3 services.
+const COULEURS = {                       // couleur de fond de la ligne dans Google Sheets
+  "Demande reçue"       : {red:1,    green:0.94, blue:0.70},   // jaune
+  "Dérogation demandée" : {red:0.97, green:0.75, blue:0.76}    // rouge
+};
 
 /* ══════════════════════════════════════════════════════════════
    2) ÉTAT
@@ -642,19 +654,54 @@ function login(){
   gateErr('');
   tokenClient.requestAccessToken({prompt: TOKEN?'':'consent'});
 }
+let SHEET_ID_CMD = null;
+async function getSheetIdCmd(){
+  if(SHEET_ID_CMD !== null) return SHEET_ID_CMD;
+  const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.SPREADSHEET_ID}?fields=sheets.properties(sheetId,title)`,
+                        {headers:{Authorization:'Bearer '+TOKEN}});
+  if(!r.ok) return null;
+  const j = await r.json();
+  const sh = (j.sheets||[]).find(x=>x.properties.title === CONFIG.SHEETS.commandes);
+  SHEET_ID_CMD = sh ? sh.properties.sheetId : null;
+  return SHEET_ID_CMD;
+}
+
+/* colore la ligne qui vient d'être écrite, selon le statut */
+async function colorerLigne(updatedRange, statut){
+  const couleur = COULEURS[statut]; if(!couleur) return;
+  const sid = await getSheetIdCmd(); if(sid === null) return;
+  const m = String(updatedRange||'').match(/!\D+(\d+)/); if(!m) return;
+  const ligne = parseInt(m[1],10) - 1;                       // l'API compte à partir de 0
+  try{
+    await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.SPREADSHEET_ID}:batchUpdate`,{
+      method:'POST', headers:{Authorization:'Bearer '+TOKEN,'Content-Type':'application/json'},
+      body: JSON.stringify({requests:[{repeatCell:{
+        range:{sheetId:sid, startRowIndex:ligne, endRowIndex:ligne+1, startColumnIndex:0, endColumnIndex:15},
+        cell:{userEnteredFormat:{backgroundColor:couleur}},
+        fields:'userEnteredFormat.backgroundColor'
+      }}]})
+    });
+  }catch(e){ console.warn('coloration impossible', e); }
+}
+
 async function appendCommande(row){
   if(DEMO){
     DB.commandes.push({id:row[0],date:parseDate(row[1]),matricule:row[2],nom:row[3],ref:row[4],des:row[5],
       secteur:row[6],qte:num(row[7]),pu:num(row[8]),montant:num(row[9]),statut:row[10],motif:row[11],src:'Commande'});
-    alertBox("Mode démo : demande enregistrée localement uniquement.",''); render(); resetForm(); return;
+    alertBox(`Mode démo : « ${row[10]} » enregistré localement uniquement.`,''); render(); resetForm(); return;
   }
   if(!TOKEN){ pending=row; login(); return; }
-  const url=`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.SPREADSHEET_ID}/values/${encodeURIComponent(CONFIG.SHEETS.commandes)}!A:L:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const url=`https://sheets.googleapis.com/v4/spreadsheets/${CONFIG.SPREADSHEET_ID}/values/${encodeURIComponent(CONFIG.SHEETS.commandes)}!A:O:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
   try{
     const r=await fetch(url,{method:'POST',headers:{'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'},body:JSON.stringify({values:[row]})});
     if(r.status===401){ TOKEN=null; pending=row; login(); return; }
     if(!r.ok) throw new Error((await r.json()).error?.message||r.status);
-    alertBox(`Demande <b>${row[0]}</b> enregistrée dans l'onglet Commandes.`,'ok');
+    const j = await r.json();
+    await colorerLigne(j.updates?.updatedRange, row[10]);
+    const dero = row[10]==='Dérogation demandée';
+    alertBox(dero
+      ? `Dérogation <b>${row[0]}</b> enregistrée (ligne rouge). En attente des validations Magasin, HSE et RH.`
+      : `Demande <b>${row[0]}</b> enregistrée (ligne jaune) dans l'onglet Commandes.`, 'ok');
     await loadAll(); resetForm();
   }catch(e){ alertBox(`Enregistrement impossible : ${e.message}`,'err'); }
 }
@@ -786,20 +833,42 @@ function checkEligibilite(){
   $('#stampT').textContent=e.ok?'Demande reçue':'Non éligible';
   $('#stampD').textContent=e.motif;
   $('#stampR').textContent=`${m} · ${r} · ${q} × ${fmt(catOf(r).pu,2)} = ${fmt(q*catOf(r).pu,2)}`;
-  $('#btnSend').style.display=e.ok?'block':'none';
+  $('#btnSend').style.display = e.ok ? 'block' : 'none';
+  const hors = !e.ok && /Matricule|indéterminé/i.test(e.motif);   // pas de dérogation possible sur un matricule inconnu
+  $('#deroBox').style.display = (!e.ok && !hors) ? 'block' : 'none';
   renderDotation();
 }
 
-function sendCommande(){
+function envoyer(mode){
   const m=$('#cMat').value.trim(), r=$('#cRef').value, q=Math.max(1,+$('#cQte').value||1);
-  const e=eligibilite(m,r,q); if(!e.ok){ checkEligibilite(); return; }
+  const e=eligibilite(m,r,q);
+
+  if(mode==='dero'){
+    if(e.ok){ checkEligibilite(); return; }
+    const just=$('#cJust').value.trim();
+    if(just.length<5){ alertBox("Explique le motif de la dérogation (5 caractères minimum).",'err'); $('#cJust').focus(); return; }
+    ecrire(m,r,q,'Dérogation demandée', `${e.motif} | Motif invoqué : ${just}`);
+  }else{
+    if(!e.ok){ checkEligibilite(); return; }
+    ecrire(m,r,q,'Demande reçue', e.motif);
+  }
+}
+
+function ecrire(m,r,q,statut,motif){
   const c=catOf(r), d=new Date(), a=agentOf(m);
   const id='CMD-'+d.getFullYear()+String(d.getMonth()+1).padStart(2,'0')+String(d.getDate()).padStart(2,'0')+'-'+Math.random().toString(36).slice(2,6).toUpperCase();
-  const row=[id, d.toISOString().slice(0,10), m, a?.nom||'', r, c.des, secteurOf(m)||'', q, c.pu, +(q*c.pu).toFixed(2), 'Demande reçue', e.motif];
-  $('#btnSend').disabled=true;
-  Promise.resolve(appendCommande(row)).finally(()=>{ $('#btnSend').disabled=false; });
+  //     A   B     C  D          E  F      G                H  I     J                       K       L      M   N   O
+  const row=[id, d.toISOString().slice(0,10), m, a?.nom||'', r, c.des, secteurOf(m)||'', q, c.pu,
+             +(q*c.pu).toFixed(2), statut, motif, '', '', ''];
+  $('#btnSend').disabled=true; $('#btnDero').disabled=true;
+  Promise.resolve(appendCommande(row)).finally(()=>{ $('#btnSend').disabled=false; $('#btnDero').disabled=false; });
 }
-function resetForm(){ $('#cRef').value=''; $('#cQte').value=1; $('#stamp').className='stamp'; $('#btnSend').style.display='none'; renderDotation(); }
+
+function resetForm(){
+  $('#cRef').value=''; $('#cQte').value=1; $('#cJust').value='';
+  $('#stamp').className='stamp'; $('#btnSend').style.display='none'; $('#deroBox').style.display='none';
+  renderDotation();
+}
 
 let hRows=[];
 function renderHist(){
@@ -820,7 +889,7 @@ function renderHist(){
     <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${l.des||catOf(l.ref).des}</td>
     <td style="font-size:12px;color:var(--ink-soft)">${l.secteur||'—'}</td>
     <td class="num">${l.qte}</td><td class="num" style="font-weight:600">${fmt(l.montant,2)}</td>
-    <td style="font-size:12px">${l.statut||'—'}</td></tr>`).join('')
+    <td style="font-size:12px">${l.statut==='Dérogation demandée'?'<span class="tag ko">Dérogation</span>':(l.statut||'—')}</td></tr>`).join('')
     : `<tr><td colspan="8"><div class="empty">${m?'Aucun mouvement pour ce matricule.':'Saisis un matricule.'}</div></td></tr>`;
 }
 
@@ -870,11 +939,12 @@ document.querySelectorAll('.cur button').forEach(b=>b.onclick=()=>{
 });
 $('#year').onchange=renderDash;
 $('#secteur').onchange=renderDash;
-$('#cMat').oninput=()=>{ $('#stamp').className='stamp'; $('#btnSend').style.display='none'; renderDotation(); };
+$('#cMat').oninput=()=>{ $('#stamp').className='stamp'; $('#btnSend').style.display='none'; $('#deroBox').style.display='none'; renderDotation(); };
 $('#cRef').onchange=renderDotation;
 $('#cQte').oninput=renderDotation;
 $('#btnCheck').onclick=checkEligibilite;
-$('#btnSend').onclick=sendCommande;
+$('#btnSend').onclick=()=>envoyer('normal');
+$('#btnDero').onclick=()=>envoyer('dero');
 $('#btnHist').onclick=renderHist;
 $('#btnCsv').onclick=exportCsv;
 $('#hMat').onkeydown=e=>{ if(e.key==='Enter') renderHist(); };
