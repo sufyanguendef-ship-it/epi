@@ -546,7 +546,7 @@ function initAuth(){
     callback:resp=>{
       if(!resp.access_token) return;
       TOKEN=resp.access_token;
-      $('#authDot').classList.add('ok'); $('#authTxt').textContent='Connecté';
+      $('#authDot').classList.add('ok'); $('#authTxt').textContent='Connecté'; alertBox('');
       if(pending){ const p=pending; pending=null; appendCommande(p); } else loadAll();
       $('#authTxt').textContent='Connecté';
     }
@@ -813,10 +813,14 @@ function boot(tries){
   if(window.google?.accounts?.oauth2){
     initAuth();
     if(CONFIG.OAUTH_CLIENT_ID && !CONFIG.API_KEY){
-      alertBox("Connexion à Google en cours…");
-      tokenClient.requestAccessToken({prompt:''});   // silencieux si déjà autorisé
-      // filet de sécurité : si Google ne répond pas en 8 s, on bascule en démo
-      setTimeout(()=>{ if(!TOKEN && !DB.mvts.length) loadDemo(); }, 8000);
+      // Chrome bloque toute pop-up non déclenchée par un clic : on affiche un bouton.
+      loadDemo(true);
+      $('#alert').innerHTML =
+        `<div class="banner" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+           <span style="flex:1;min-width:220px">Connecte-toi avec ton compte Google pour charger les données réelles de la Sheet.</span>
+           <button class="btn" id="btnBoot">Se connecter avec Google</button>
+         </div>`;
+      $('#btnBoot').onclick = login;
     } else loadAll();
     return;
   }
